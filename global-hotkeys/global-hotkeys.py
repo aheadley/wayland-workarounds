@@ -5,72 +5,247 @@ import itertools
 import logging
 import os
 import os.path
+import pwd
 import time
 import tomllib
+from collections.abc import Iterable, Sequence, Collection, Callable
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Any, Tuple
 
 import dbus
 from libinput import LibInput, ContextType, EventType, DeviceCapability
 from libinput.constant import ButtonState, KeyState
+from libinput.event import Event as LibInputEvent, KeyboardEvent, PointerEvent
+from libinput.device import Device as LibInputDevice
 from libevdev._clib import Libevdev
+import threading
+import argparse
 
-APP_NAME = "global-shortcuts"
+APP_NAME = "global-hotkeys"
 
-XDG_CONFIG_HOME = os.getenv("XDG_CONFIG_HOME") or "{HOME}/.config"
-XDG_CONFIG_DIRS = os.getenv("XDG_CONFIG_DIRS") or "/etc/xdg"
-XDG_CONFIG_DIRS = XDG_CONFIG_DIRS.split(":")
+ENV_HOME = os.getenv("HOME") or pwd.getpwuid(os.geteuid()).pw_dir
+XDG_CONFIG_HOME = os.getenv("XDG_CONFIG_HOME") or os.path.join(ENV_HOME, ".config")
 
-DEFAULT_SEAT = "seat0"
-CONFIG_KEYS = ["keycodes", "actions", "devices"]
-DEFAULT_KEYCODE_STATE = KeyState.PRESSED
-DEFAULT_ACTION_TYPE = "DBUS"
-
-EV_KEY = Libevdev._event_type_from_name("EV_KEY".encode())
-VALID_EVENT_TYPES = [
+EV_KEY: int = Libevdev._event_type_from_name("EV_KEY".encode())
+VALID_EVENT_TYPES: tuple[EventType] = (
     EventType.KEYBOARD_KEY,
     EventType.POINTER_BUTTON,
-]
+)
 
-SimpleEvent = collections.namedtuple('SimpleEvent', [
-    "name",
-    "keycode",
-    "state",
-    "action",
-    "device",
-])
-# ComboEvent = collections.namedtuple('ComboEvent')
+class ActionType(Enum):
+    DBUS = auto()
+    EXEC = auto()
 
-def config_merge(base, next):
-    result = {}
-    for config_key in CONFIG_KEYS:
-        result[config_key] = base[config_key].copy()
-        for key_group in next[config_key]:
-            if key_group in base[config_key]:
-                result[config_key][key_group] += next[config_key][key_group]
+DEFAULT_CONFIG_FILENAME = "config.toml"
+DEFAULT_CONFIG_PATH = os.path.join(XDG_CONFIG_HOME, APP_NAME, DEFAULT_CONFIG_FILENAME)
+DEFAULT_SEAT = "seat0"
+DEFAULT_KEYCODE_STATE = "PRESSED"
+DEFAULT_ACTION_TYPE = ActionType.DBUS
+
+InputEvent = KeyboardEvent|PointerEvent
+InputState = KeyState|ButtonState
+
+def key_name_from_code(keycode: int) -> str:
+    return Libevdev._event_code_get_name(EV_KEY, keycode).decode()
+
+def keycode_from_name(key_name: str) -> int:
+    return Libevdev._event_code_from_name(EV_KEY, key_name.encode())
+
+@dataclass
+class SimpleBinding:
+    name: str
+    keycodes: Tuple[int]
+    state: KeyState|ButtonState
+    action: Callable
+    device: LibInputDevice|None
+
+    def matches(self, event: InputEvent, held_keys: set[int]) -> bool:
+        if self.device is None or self.device == event.device:
+            if len(self.keycodes) > 1:
+                if all(kc in held_keys for kc in self.keycodes):
+                    return True
             else:
-                result[config_key][key_group] = next[config_key][key_group]
-    return result
+                if get_event_keycode(event) == self.keycodes[0] and get_event_state(event) == self.state:
+                    return True
 
-def load_config(config_filename=None):
-    CONFIG_FILE_PATHS = [os.path.join(p, APP_NAME) for p in [XDG_CONFIG_HOME] + XDG_CONFIG_DIRS]
-    if config_filename is None:
-        config_filename = os.path.join(XDG_CONFIG_HOME, APP_NAME)
-    config_filenames = [config_filename] + CONFIG_FILE_PATHS
+@dataclass
+class BindingTriggeredEvent:
+    timestamp: int
+    source_event: LibInputEvent
+    matched_binding: SimpleBinding
 
-    config = {
-        "keycodes": {},
-        "actions": {},
-        "devices": {},
-    }
+    def run(self):
+        print(self)
+        self.matched_binding.action()
 
-    for cf in config_filenames[::-1]:
+class ActionParser:
+    @classmethod
+    def parse(cls, action_str: str, dbus_handle: dbus.SessionBus) -> Callable:
+        action_sep = ":"
+        action_str = action_str.strip()
         try:
-            with open(cf, "rb") as h:
-                config_data = tomllib.load(h)
-            config = config_merge(config, config_data)
-        except Exception as e:
-            print(e)
+            action_type_str, _ = action_str.split(action_sep)
+            try:
+                action_type = ActionType[action_type_str.upper()]
+                action_str = action_str[len(action_type_str) + len(action_sep):]
+            except KeyError:
+                # either invalid action type or implicit default
+                action_type = DEFAULT_ACTION_TYPE
+        except ValueError:
+            action_type = DEFAULT_ACTION_TYPE
 
-    return config
+        if action_type == ActionType.DBUS:
+            return cls.build_dbus_action(action_str, dbus_handle)
+        elif action_type == ActionType.EXEC:
+            return cls.build_exec_action(action_str)
+
+    @classmethod
+    def build_dbus_action(cls, action_str: str, dbus_handle: dbus.SessionBus) -> Callable:
+        parts = action_str.split("/")
+        namespace = parts[0]
+        method = parts[-1]
+        path = action_str.removeprefix(namespace).removesuffix(method)
+
+        def dbus_action():
+            try:
+                object = dbus_handle.get_object(namespace, path)
+                object_method = object.get_dbus_method(method)
+                try:
+                    object_method()
+                except dbus.exceptions.DBusException as call_err:
+                    pass
+            except dbus.exceptions.DBusException as object_err:
+                pass
+
+        return dbus_action
+
+    @classmethod
+    def build_exec_action(cls, action_str: str) -> Callable:
+        def exec_action():
+            try:
+                os.system(action_str)
+            except Exception:
+                pass
+        return exec_action
+
+class ConfigManager:
+    def __init__(self, config_filename=DEFAULT_CONFIG_PATH):
+        self._config: dict[str, dict] = {}
+        self._config_filename = config_filename
+        self.load()
+
+    def __getitem__(self, key: str):
+        return self._config[key]
+
+    def _parse_keycode(self, keycode_str: str) -> Tuple[str, InputState]:
+        try:
+            key_name, state = keycode_str.split(":", 1)
+            state = state.upper()
+        except ValueError:
+            key_name = keycode_str
+            state = DEFAULT_KEYCODE_STATE
+        if key_name.startswith("KEY_"):
+            state_typed = KeyState[state]
+        elif key_name.startswith("BTN_"):
+            state_typed = ButtonState[state]
+        else:
+            raise ValueError(f"Unknown type for key state: {state}")
+
+        return key_name, state_typed
+
+    def load(self):
+        with open(self._config_filename, "rb") as config_handle:
+            self._config = tomllib.load(config_handle)
+
+    def generate_bindings(self, dbus_handle: dbus.SessionBus, active_devices: dict[str, LibInputDevice]):
+        for binding_name, binding_data in self._config["bindings"].items():
+            binding_name: str
+            binding_data: dict[str, Any]
+
+            actions = [
+                ActionParser.parse(action, dbus_handle) for action in binding_data["actions"]
+            ]
+            try:
+                devices = binding_data["devices"]
+                # TODO: filter devices from active_devices
+            except KeyError:
+                devices = [None]
+            for device in devices:
+                if "keycodes" in binding_data:
+                    for keycode_str in binding_data["keycodes"]:
+                        key_name, key_state = self._parse_keycode(keycode_str)
+                        keycode = keycode_from_name(key_name)
+                        for action in actions:
+                            yield SimpleBinding(
+                                name=binding_name,
+                                keycodes=(keycode,),
+                                state=key_state,
+                                action=action,
+                                device=device,
+                            )
+                if "keycode-combos" in binding_data:
+                    for combo_set in binding_data["keycode-combos"]:
+                        keycodes = tuple(keycode_from_name(self._parse_keycode(keycode)[0]) \
+                                        for keycode in combo_set)
+                        for action in actions:
+                            yield SimpleBinding(
+                                name=binding_name,
+                                keycodes=keycodes,
+                                state=KeyState[DEFAULT_KEYCODE_STATE],
+                                action=action,
+                                device=device,
+                            )
+def get_event_state(ev: InputEvent) -> bool:
+    try:
+        return ev.key_state
+    except AttributeError:
+        return ev.button_state
+
+def get_event_keycode(ev: InputEvent) -> int:
+    try:
+        return ev.key
+    except AttributeError:
+        return ev.button
+
+class EventManager:
+    def __init__(self, config: ConfigManager, input_handle: LibInput=None, dbus_handle: dbus.SessionBus=None):
+        self._config = config
+        if input_handle is None:
+            input_handle = get_input_handle()
+        if dbus_handle is None:
+            dbus_handle = get_dbus_handle()
+        self._libinput = input_handle
+        self._dbus_handle = dbus_handle
+        self._bindings = list(self._config.generate_bindings(self._dbus_handle, {}))
+        self._held_keys: dict[int, bool] = {}
+
+    def _mark_held(self, ev: InputEvent):
+        if get_event_state(ev):
+            self._held_keys[get_event_keycode(ev)] = True
+        else:
+            self._held_keys[get_event_keycode(ev)] = False
+
+    @property
+    def held_keys(self) -> set[int]:
+        return set(filter(lambda kc: self._held_keys[kc], self._held_keys.keys()))
+
+    def run_once(self):
+        if self._libinput.next_event_type() is not None:
+            for ev in self._libinput.events:
+                if ev.type in VALID_EVENT_TYPES:
+                    self._mark_held(ev)
+                    held_keys = self.held_keys
+                    for binding in self._bindings:
+                        if binding.matches(ev, held_keys):
+                            tev = BindingTriggeredEvent(time.time(), ev, binding)
+                            tev.run()
+                if self._libinput.next_event_type() is None:
+                    break
+
+    def run_forever(self, exit_flag: threading.Event):
+        while not exit_flag.is_set():
+            self.run_once()
 
 def get_dbus_handle():
     return dbus.SessionBus()
@@ -80,131 +255,24 @@ def get_input_handle():
     libinput_handle.assign_seat(DEFAULT_SEAT)
     return libinput_handle
 
-def get_bindings(config):
-    binding_names = set(config[CONFIG_KEYS[0]].keys())
-    for k in CONFIG_KEYS:
-        binding_names = binding_names.intersection(set(config[k].keys()))
-    binding_names = list(binding_names)
 
-    bindings = []
-    for binding_name in binding_names:
-        for event_product in itertools.product(config["keycodes"][binding_name],
-                                   config["actions"][binding_name],
-                                   config["devices"][binding_name]):
-            state = event_product[0].split(':')
-            keycode = get_keycode_from_key_name(state[0].upper())
-            device = DeviceCapability[event_product[2].upper()]
-            if len(state) > 1:
-                state = state[1]
-                if device == DeviceCapability.POINTER:
-                    state = ButtonState[state.upper()]
-                elif device == DeviceCapability.KEYBOARD:
-                    state = KeyState[state.upper()]
-                else:
-                    raise Exception('invalid state:{}'.format(state))
-            else:
-                if device == DeviceCapability.POINTER:
-                    state = ButtonState.PRESSED
-                else:
-                    state = DEFAULT_KEYCODE_STATE
-            binding = SimpleEvent(name=binding_name, keycode=keycode, state=state, action=event_product[1], device=device)
-            bindings.extend([
-                binding
-            ])
-            print(binding)
-    return bindings
+def main(args: list[str]):
+    parser = argparse.ArgumentParser(description="Global hotkeys")
 
-def get_key_name_from_keycode(keycode):
-    return Libevdev._event_code_get_name(EV_KEY, keycode).decode()
+    parser.add_argument('--config', default=DEFAULT_CONFIG_PATH)
 
-def get_keycode_from_key_name(key_name):
-    return Libevdev._event_code_from_name(EV_KEY, key_name.encode())
+    opts = parser.parse_args(args)
 
-def filter(binding, event):
-    if binding.device in event.device.capabilities:
-        if event.type is EventType.POINTER_BUTTON:
-            if event.button == binding.keycode \
-                    and event.button_state == binding.state:
-                return binding
-        elif event.type is EventType.KEYBOARD_KEY:
-            if event.key == binding.keycode \
-                    and event.key_state == binding.state:
-                return binding
-    return None
+    cfg = ConfigManager(opts.config)
+    evm = EventManager(cfg)
 
-def check_filter(bindings, event):
-    return (r for r in map(lambda b: filter(b, event), bindings) if r is not None)
-
-def run_action(dbus_handle, binding):
-    print(binding.action)
-    action = binding.action.split(":")
-    if len(action) > 1:
-        action_type = action[0].upper()
-        action = action[1]
-    else:
-        action_type = DEFAULT_ACTION_TYPE
-        action = action[0]
-
-    if action_type == "DBUS":
-        parts = action.split("/")
-        ns = parts[0]
-        func = parts[-1]
-        path = action.removeprefix(ns).removesuffix(func) #.rstrip("/")
-        print("dbus ns={} path={} func={}".format(ns, path, func))
-        try:
-            f = dbus_handle.get_object(ns, path).get_dbus_method(func)
-            try:
-                f()
-            except dbus.exceptions.DBusException as call_err:
-                print("call_err")
-        except dbus.exceptions.DBusException as name_err:
-            print("name_err")
-
-
-def run_loop(bindings, input_handle, dbus_handle):
-    # fake_select_nb = lambda h: h.next_event_type() and next(h.events)
-
-    keep_running = True
-    while keep_running:
-        # ev = fake_select_nb(input_handle)
-        # if ev is not None:
-        for ev in input_handle.events:
-            try:
-                if ev.type in VALID_EVENT_TYPES:
-                    if ev.type == EventType.POINTER_BUTTON:
-                        print("ev: keycode={} key_name={} state={} device={}".format(
-                            ev.button,
-                            get_key_name_from_keycode(ev.button),
-                            ev.button_state,
-                            ev.device.capabilities
-                        ))
-                    elif ev.type == EventType.KEYBOARD_KEY:
-                        print("ev: keycode={} key_name={} state={} device={}".format(
-                            ev.key,
-                            get_key_name_from_keycode(ev.key),
-                            ev.key_state,
-                            ev.device.capabilities
-                        ))
-            except AttributeError:
-                pass
-            for activated_binding in check_filter(bindings, ev):
-                run_action(dbus_handle, activated_binding)
-        time.sleep(0.01)
-
-def main(args):
-    if len(args) > 1:
-        running_config = load_config(args[1])
-    else:
-        running_config = load_config()
-    dbus_handle = get_dbus_handle()
-    input_handle = get_input_handle()
-    bindings = get_bindings(running_config)
     try:
-        run_loop(bindings, input_handle, dbus_handle)
+        exit_flag = threading.Event()
+        evm.run_forever(exit_flag)
     except KeyboardInterrupt:
-        pass
+        exit_flag.set()
 
 if __name__ == "__main__":
     import sys
 
-    main(sys.argv)
+    main(sys.argv[1:])

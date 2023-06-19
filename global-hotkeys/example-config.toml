@@ -1,24 +1,31 @@
-[keycodes]
-push-to-talk = [
-    "btn_extra",
-]
+[general]
 
-push-to-talk-release = [
-    "btn_extra:released",
-]
+foo = "bar"
 
-[actions]
-push-to-talk = [
+[bindings]
+[bindings.example-ptt]
+keycodes = ["BTN_EXTRA"]
+actions = [
     "net.sourceforge.mumble.mumble/startTalking",
 ]
-push-to-talk-release = [
+
+[bindings.example-ptt-release]
+keycodes = ["BTN_EXTRA:RELEASED"]
+actions = [
     "dbus:net.sourceforge.mumble.mumble/stopTalking",
 ]
 
-[devices]
-push-to-talk = [
-    "pointer",
+[bindings.full-example]
+keycodes = ["KEY_SPACE", "BTN_RIGHT:released"]
+keycode-combos = [
+    ["KEY_SPACE", "KEY_LEFTSHIFT"],
+    ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_DELETE"],
 ]
-push-to-talk-release = [
-    "pointer",
+actions = [
+    "exec:echo hello world",
+]
+
+# /proc/bus/input/devices
+devices = [
+    "my cool keyboard"
 ]
