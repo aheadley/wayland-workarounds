@@ -1,0 +1,24 @@
+[keycodes]
+push-to-talk = [
+    "btn_extra",
+]
+
+push-to-talk-release = [
+    "btn_extra:released",
+]
+
+[actions]
+push-to-talk = [
+    "net.sourceforge.mumble.mumble/startTalking",
+]
+push-to-talk-release = [
+    "dbus:net.sourceforge.mumble.mumble/stopTalking",
+]
+
+[devices]
+push-to-talk = [
+    "pointer",
+]
+push-to-talk-release = [
+    "pointer",
+]
