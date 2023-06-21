@@ -196,7 +196,7 @@ class ConfigManager:
                                 action=action,
                                 device=device,
                             )
-def get_event_state(ev: InputEvent) -> bool:
+def get_event_state(ev: InputEvent) -> InputState:
     try:
         return ev.key_state
     except AttributeError:
