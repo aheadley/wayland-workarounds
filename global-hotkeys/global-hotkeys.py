@@ -6,6 +6,7 @@ import logging
 import os
 import os.path
 import pwd
+import subprocess
 import time
 import tomllib
 from collections.abc import Iterable, Sequence, Collection, Callable
@@ -43,8 +44,13 @@ DEFAULT_SEAT = "seat0"
 DEFAULT_KEYCODE_STATE = "PRESSED"
 DEFAULT_ACTION_TYPE = ActionType.DBUS
 
+ACTION_TYPE_SEP: str = ":"
+DBUS_PATH_SEP: str = "/"
+
 InputEvent = KeyboardEvent|PointerEvent
 InputState = KeyState|ButtonState
+
+LOG = logging.getLogger(APP_NAME)
 
 def key_name_from_code(keycode: int) -> str:
     return Libevdev._event_code_get_name(EV_KEY, keycode).decode()
@@ -75,58 +81,64 @@ class BindingTriggeredEvent:
     source_event: LibInputEvent
     matched_binding: SimpleBinding
 
-    def run(self):
-        print(self)
-        self.matched_binding.action()
+    def run(self, state: 'RunState'):
+        LOG.info(f"Running {self.matched_binding.name}")
+        self.matched_binding.action(state)
 
 class ActionParser:
     @classmethod
-    def parse(cls, action_str: str, dbus_handle: dbus.SessionBus) -> Callable:
-        action_sep = ":"
+    def parse(cls, action_str: str) -> Callable:
         action_str = action_str.strip()
         try:
-            action_type_str, _ = action_str.split(action_sep)
+            action_type_str, _ = action_str.split(ACTION_TYPE_SEP)
             try:
                 action_type = ActionType[action_type_str.upper()]
-                action_str = action_str[len(action_type_str) + len(action_sep):]
+                action_str = action_str[len(action_type_str) + len(ACTION_TYPE_SEP):]
             except KeyError:
                 # either invalid action type or implicit default
                 action_type = DEFAULT_ACTION_TYPE
+                LOG.info(f"Defaulting to action type {action_type} for {action_str}")
         except ValueError:
             action_type = DEFAULT_ACTION_TYPE
 
         if action_type == ActionType.DBUS:
-            return cls.build_dbus_action(action_str, dbus_handle)
+            return cls.build_dbus_action(action_str)
         elif action_type == ActionType.EXEC:
             return cls.build_exec_action(action_str)
 
     @classmethod
-    def build_dbus_action(cls, action_str: str, dbus_handle: dbus.SessionBus) -> Callable:
-        parts = action_str.split("/")
+    def build_dbus_action(cls, action_str: str) -> Callable:
+        parts = action_str.split(DBUS_PATH_SEP)
         namespace = parts[0]
         method = parts[-1]
         path = action_str.removeprefix(namespace).removesuffix(method)
 
-        def dbus_action():
+        def dbus_action(state: 'RunState') -> None:
             try:
-                object = dbus_handle.get_object(namespace, path)
+                object = state.dbus_session_handle.get_object(namespace, path)
                 object_method = object.get_dbus_method(method)
                 try:
                     object_method()
                 except dbus.exceptions.DBusException as call_err:
-                    pass
+                    LOG.warning(f"Error calling {action_str}: {call_err}")
             except dbus.exceptions.DBusException as object_err:
-                pass
+                LOG.warning(f"Error getting object {action_str}: {object_err}")
 
         return dbus_action
 
     @classmethod
     def build_exec_action(cls, action_str: str) -> Callable:
-        def exec_action():
+        def exec_action(state: 'RunState') -> None:
             try:
-                os.system(action_str)
-            except Exception:
-                pass
+                ret = subprocess.call(action_str, shell=True,
+                    timeout=(state.config["general"]["exec-timeout"] / 1000),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL)
+                LOG.debug(f"Executed {action_str} with return code {ret}")
+            except subprocess.TimeoutExpired as err:
+                LOG.warning(f"Timeout executing {action_str}: {err}")
+            except OSError as err:
+                LOG.warning(f"Error executing {action_str}: {err}")
         return exec_action
 
 class ConfigManager:
@@ -158,13 +170,15 @@ class ConfigManager:
         with open(self._config_filename, "rb") as config_handle:
             self._config = tomllib.load(config_handle)
 
-    def generate_bindings(self, dbus_handle: dbus.SessionBus, active_devices: dict[str, LibInputDevice]):
+    def generate_bindings(self, active_devices: dict[str, LibInputDevice] = None):
+        if active_devices is None:
+            active_devices = {}
         for binding_name, binding_data in self._config["bindings"].items():
             binding_name: str
             binding_data: dict[str, Any]
 
             actions = [
-                ActionParser.parse(action, dbus_handle) for action in binding_data["actions"]
+                ActionParser.parse(action) for action in binding_data["actions"]
             ]
             try:
                 devices = binding_data["devices"]
@@ -177,25 +191,30 @@ class ConfigManager:
                         key_name, key_state = self._parse_keycode(keycode_str)
                         keycode = keycode_from_name(key_name)
                         for action in actions:
-                            yield SimpleBinding(
+                            binding = SimpleBinding(
                                 name=binding_name,
                                 keycodes=(keycode,),
                                 state=key_state,
                                 action=action,
                                 device=device,
                             )
+                            LOG.debug(f"Generated binding: {binding}")
+                            yield binding
                 if "keycode-combos" in binding_data:
                     for combo_set in binding_data["keycode-combos"]:
                         keycodes = tuple(keycode_from_name(self._parse_keycode(keycode)[0]) \
                                         for keycode in combo_set)
                         for action in actions:
-                            yield SimpleBinding(
+                            binding = SimpleBinding(
                                 name=binding_name,
                                 keycodes=keycodes,
                                 state=KeyState[DEFAULT_KEYCODE_STATE],
                                 action=action,
                                 device=device,
                             )
+                            LOG.debug(f"Generated combo binding: {binding}")
+                            yield binding
+
 def get_event_state(ev: InputEvent) -> InputState:
     try:
         return ev.key_state
@@ -208,16 +227,14 @@ def get_event_keycode(ev: InputEvent) -> int:
     except AttributeError:
         return ev.button
 
+@dataclass
+class RunState:
+    dbus_session_handle: dbus.SessionBus
+    libinput_handle: LibInput
+    config: ConfigManager
+
 class EventManager:
-    def __init__(self, config: ConfigManager, input_handle: LibInput=None, dbus_handle: dbus.SessionBus=None):
-        self._config = config
-        if input_handle is None:
-            input_handle = get_input_handle()
-        if dbus_handle is None:
-            dbus_handle = get_dbus_handle()
-        self._libinput = input_handle
-        self._dbus_handle = dbus_handle
-        self._bindings = list(self._config.generate_bindings(self._dbus_handle, {}))
+    def __init__(self):
         self._held_keys: dict[int, bool] = {}
 
     def _mark_held(self, ev: InputEvent):
@@ -230,27 +247,35 @@ class EventManager:
     def held_keys(self) -> set[int]:
         return set(filter(lambda kc: self._held_keys[kc], self._held_keys.keys()))
 
-    def run_once(self):
-        if self._libinput.next_event_type() is not None:
-            for ev in self._libinput.events:
-                if ev.type in VALID_EVENT_TYPES:
-                    self._mark_held(ev)
-                    held_keys = self.held_keys
-                    for binding in self._bindings:
-                        if binding.matches(ev, held_keys):
-                            tev = BindingTriggeredEvent(time.time(), ev, binding)
-                            tev.run()
-                if self._libinput.next_event_type() is None:
-                    break
+    def run_once(self, event_stream, state: RunState, bindings: list[SimpleBinding]):
+        ev = next(event_stream)
+        if ev.type in VALID_EVENT_TYPES:
+            LOG.debug(f"Received event: {ev}")
+            self._mark_held(ev)
+            held_keys = self.held_keys
+            for binding in bindings:
+                if binding.matches(ev, held_keys):
+                    tev = BindingTriggeredEvent(time.time(), ev, binding)
+                    tev.run(state)
 
-    def run_forever(self, exit_flag: threading.Event):
-        while not exit_flag.is_set():
-            self.run_once()
+    def run_forever(self, state: RunState, bindings: list[SimpleBinding] = None):
+        if bindings is None:
+            bindings = list(state.config.generate_bindings())
+            LOG.info(f"Using implicitly generated bindings: {len(bindings)}")
 
-def get_dbus_handle():
+        event_stream = state.libinput_handle.events
+
+        while True:
+            try:
+                self.run_once(event_stream, state, bindings)
+            except KeyboardInterrupt:
+                break
+            time.sleep(0.01)
+
+def get_dbus_handle() -> dbus.SessionBus:
     return dbus.SessionBus()
 
-def get_input_handle():
+def get_input_handle() -> LibInput:
     libinput_handle = LibInput(context_type=ContextType.UDEV)
     libinput_handle.assign_seat(DEFAULT_SEAT)
     return libinput_handle
@@ -263,16 +288,14 @@ def main(args: list[str]):
 
     opts = parser.parse_args(args)
 
-    cfg = ConfigManager(opts.config)
-    evm = EventManager(cfg)
-
-    try:
-        exit_flag = threading.Event()
-        evm.run_forever(exit_flag)
-    except KeyboardInterrupt:
-        exit_flag.set()
+    state = RunState(get_dbus_handle(),
+                     get_input_handle(),
+                     ConfigManager(opts.config))
+    evm = EventManager()
+    evm.run_forever(state)
 
 if __name__ == "__main__":
     import sys
 
+    logging.basicConfig(level=logging.DEBUG)
     main(sys.argv[1:])

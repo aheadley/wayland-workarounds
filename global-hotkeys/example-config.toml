@@ -1,6 +1,6 @@
 [general]
-
-foo = "bar"
+# exec commands that take longer than this (in milliseconds) will be terminated
+exec-timeout = 1000
 
 [bindings]
 [bindings.example-ptt]
@@ -22,10 +22,10 @@ keycode-combos = [
     ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_DELETE"],
 ]
 actions = [
-    "exec:echo hello world",
+    "exec:sleep 10",
 ]
 
 # /proc/bus/input/devices
-devices = [
-    "my cool keyboard"
-]
+# devices = [
+#     "my cool keyboard"
+# ]
