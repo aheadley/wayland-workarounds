@@ -15,17 +15,12 @@ actions = [
     "dbus:net.sourceforge.mumble.mumble/stopTalking",
 ]
 
-[bindings.full-example]
-keycodes = ["KEY_SPACE", "BTN_RIGHT:released"]
-keycode-combos = [
-    ["KEY_SPACE", "KEY_LEFTSHIFT"],
-    ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_DELETE"],
-]
-actions = [
-    "exec:sleep 10",
-]
-
-# /proc/bus/input/devices
-# devices = [
-#     "my cool keyboard"
+# [bindings.full-example]
+# keycodes = ["KEY_SPACE", "BTN_RIGHT:released"]
+# keycode-combos = [
+#     ["KEY_SPACE", "KEY_LEFTSHIFT"],
+#     ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_DELETE"],
+# ]
+# actions = [
+#     "exec:/bin/true",
 # ]
