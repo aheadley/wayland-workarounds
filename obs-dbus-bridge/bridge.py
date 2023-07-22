@@ -12,7 +12,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4455
 
 try:
-    import obspython as libobs
+    import obspython as libobs # pyright: ignore
 except ImportError:
     libobs = None
 
