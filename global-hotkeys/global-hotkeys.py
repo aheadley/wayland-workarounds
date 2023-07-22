@@ -131,7 +131,7 @@ class ActionParser:
         parts = action_str.split(DBUS_PATH_SEP)
         namespace = parts[0]
         method = parts[-1]
-        path = action_str.removeprefix(namespace).removesuffix(method)
+        path = action_str.removeprefix(namespace).removesuffix(method).rstrip(DBUS_PATH_SEP) or DBUS_PATH_SEP
         LOG.debug(f"Building DBUS action: namespace={namespace} path={path} method={method}")
 
         def dbus_action(state: 'RunState') -> None:
