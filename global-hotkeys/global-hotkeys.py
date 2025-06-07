@@ -285,15 +285,18 @@ class EventManager:
         return set(filter(lambda kc: self._held_keys[kc], self._held_keys.keys()))
 
     def run_once(self, event_stream, state: RunState, bindings: list[SimpleBinding]):
-        ev = next(event_stream)
-        if ev.type in VALID_EVENT_TYPES:
-            LOG.debug(f"Received event: {event_repr(ev)}")
-            self._mark_held(ev)
-            held_keys = self.held_keys
-            for binding in bindings:
-                if binding.matches(ev, held_keys):
-                    tev = BindingTriggeredEvent(time.time(), ev, binding)
-                    tev.run(state)
+        # skip through events until we find one we can maybe act on
+        for ev in event_stream:
+            if ev.type in VALID_EVENT_TYPES:
+                break
+
+        LOG.debug(f"Received event: {event_repr(ev)}")
+        self._mark_held(ev)
+        held_keys = self.held_keys
+        for binding in bindings:
+            if binding.matches(ev, held_keys):
+                tev = BindingTriggeredEvent(time.time(), ev, binding)
+                tev.run(state)
 
     def run_forever(self, state: RunState, bindings: list[SimpleBinding] = None):
         if bindings is None:
